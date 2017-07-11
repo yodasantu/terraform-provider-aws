@@ -5,11 +5,14 @@ import (
 	"log"
 	"time"
 
+	"strings"
+
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/service/kinesis"
 	"github.com/hashicorp/terraform/helper/resource"
 	"github.com/hashicorp/terraform/helper/schema"
+	"github.com/hashicorp/terraform/helper/validation"
 )
 
 func resourceAwsKinesisStream() *schema.Resource {
@@ -53,6 +56,24 @@ func resourceAwsKinesisStream() *schema.Resource {
 				Optional: true,
 				Elem:     &schema.Schema{Type: schema.TypeString},
 				Set:      schema.HashString,
+			},
+
+			"encryption_type": {
+				Type:         schema.TypeString,
+				Optional:     true,
+				Default:      "NONE",
+				ValidateFunc: validation.StringInSlice([]string{"NONE", "KMS"}, true),
+				DiffSuppressFunc: func(k, old, new string, d *schema.ResourceData) bool {
+					if strings.ToLower(old) == strings.ToLower(new) {
+						return true
+					}
+					return false
+				},
+			},
+
+			"kms_key_id": {
+				Type:     schema.TypeString,
+				Optional: true,
 			},
 
 			"arn": {
@@ -132,6 +153,12 @@ func resourceAwsKinesisStreamUpdate(d *schema.ResourceData, meta interface{}) er
 		return err
 	}
 
+	if d.HasChange("encryption_type") || d.HasChange("kms_key_id") {
+		if err := updateKinesisStreamEncryption(conn, d); err != nil {
+			return err
+		}
+	}
+
 	return resourceAwsKinesisStreamRead(d, meta)
 }
 
@@ -155,6 +182,9 @@ func resourceAwsKinesisStreamRead(d *schema.ResourceData, meta interface{}) erro
 	d.Set("arn", state.arn)
 	d.Set("shard_count", len(state.openShards))
 	d.Set("retention_period", state.retentionPeriod)
+
+	d.Set("encryption_type", state.encryptionType)
+	d.Set("keyId", state.keyId)
 
 	if len(state.shardLevelMetrics) > 0 {
 		d.Set("shard_level_metrics", state.shardLevelMetrics)
@@ -274,6 +304,69 @@ func updateKinesisShardCount(conn *kinesis.Kinesis, d *schema.ResourceData) erro
 	return nil
 }
 
+func updateKinesisStreamEncryption(conn *kinesis.Kinesis, d *schema.ResourceData) error {
+	sn := d.Get("name").(string)
+	encryptionType := d.Get("encryption_type").(string)
+
+	if strings.ToUpper(encryptionType) == "KMS" {
+		if _, ok := d.GetOk("kms_key_id"); !ok {
+			return fmt.Errorf("KMS Key Id required when setting encryption_type to KMS")
+		}
+
+		log.Printf("[INFO] Starting Stream Encryption for %s", sn)
+		params := &kinesis.StartStreamEncryptionInput{
+			StreamName:     aws.String(sn),
+			EncryptionType: aws.String(encryptionType),
+			KeyId:          aws.String(d.Get("kms_key_id").(string)),
+		}
+
+		_, err := conn.StartStreamEncryption(params)
+		if err != nil {
+			return err
+		}
+	} else {
+		// The quirk about this API is that, when we are disabling the StreamEncryption
+		// We need to pass in that old KMS Key Id that was being used for Encryption and
+		// We also need to pass in the type of Encryption we were using - i.e. KMS as that
+		// Is the only supported Encryption method right now
+		// If we don't get this and pass in the actual EncryptionType we want to move to i.e. NONE
+		// We get the following error
+		//
+		//        InvalidArgumentException: Encryption type cannot be NONE.
+		oldKey, _ := d.GetChange("kms_key_id")
+
+		log.Printf("[INFO] Stopping Stream Encryption for %s", sn)
+		params := &kinesis.StopStreamEncryptionInput{
+			StreamName:     aws.String(sn),
+			EncryptionType: aws.String("KMS"),
+			KeyId:          aws.String(oldKey.(string)),
+		}
+
+		_, err := conn.StopStreamEncryption(params)
+		if err != nil {
+			return err
+		}
+	}
+
+	stateConf := &resource.StateChangeConf{
+		Pending:    []string{"UPDATING"},
+		Target:     []string{"ACTIVE"},
+		Refresh:    streamStateRefreshFunc(conn, sn),
+		Timeout:    5 * time.Minute,
+		Delay:      10 * time.Second,
+		MinTimeout: 3 * time.Second,
+	}
+
+	_, err := stateConf.WaitForState()
+	if err != nil {
+		return fmt.Errorf(
+			"Error waiting for Stream (%s) to be ACTIVE: %s",
+			sn, err)
+	}
+
+	return nil
+}
+
 func updateKinesisShardLevelMetrics(conn *kinesis.Kinesis, d *schema.ResourceData) error {
 	sn := d.Get("name").(string)
 
@@ -337,6 +430,8 @@ type kinesisStreamState struct {
 	openShards        []string
 	closedShards      []string
 	shardLevelMetrics []string
+	encryptionType    string
+	keyId             string
 }
 
 func readKinesisStreamState(conn *kinesis.Kinesis, sn string) (*kinesisStreamState, error) {
@@ -353,6 +448,8 @@ func readKinesisStreamState(conn *kinesis.Kinesis, sn string) (*kinesisStreamSta
 		state.openShards = append(state.openShards, flattenShards(openShards(page.StreamDescription.Shards))...)
 		state.closedShards = append(state.closedShards, flattenShards(closedShards(page.StreamDescription.Shards))...)
 		state.shardLevelMetrics = flattenKinesisShardLevelMetrics(page.StreamDescription.EnhancedMonitoring)
+		state.encryptionType = aws.StringValue(page.StreamDescription.EncryptionType)
+		state.keyId = aws.StringValue(page.StreamDescription.KeyId)
 		return !last
 	})
 	return state, err
