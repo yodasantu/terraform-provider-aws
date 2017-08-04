@@ -1087,6 +1087,29 @@ func TestAccAWSInstance_addSecurityGroupNetworkInterface(t *testing.T) {
 	})
 }
 
+// https://github.com/terraform-providers/terraform-provider-aws/issues/227
+func TestAccAWSInstance_explicitAssociatePublicAddress(t *testing.T) {
+	var before ec2.Instance
+	resName := "aws_instance.foo"
+	rInt := acctest.RandInt()
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:     func() { testAccPreCheck(t) },
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckInstanceDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: testAccInstanceConfigExplicitPublicAddress(rInt),
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckInstanceExists(resName, &before),
+					resource.TestCheckResourceAttr(resName, "associate_public_ip_address", "false"),
+					resource.TestCheckResourceAttr(resName, "public_ip", ""),
+				),
+			},
+		},
+	})
+}
+
 func testAccCheckInstanceNotRecreated(t *testing.T,
 	before, after *ec2.Instance) resource.TestCheckFunc {
 	return func(s *terraform.State) error {
@@ -2305,3 +2328,30 @@ resource "aws_network_interface" "bar" {
     }
 }
 `
+
+func testAccInstanceConfigExplicitPublicAddress(rInt int) string {
+	return fmt.Sprintf(`
+resource "aws_vpc" "my_vpc" {
+  cidr_block = "172.16.0.0/16"
+  tags {
+    Name = "tf-acctest-%d"
+  }
+}
+
+resource "aws_subnet" "public_subnet" {
+  vpc_id = "${aws_vpc.my_vpc.id}"
+  cidr_block = "172.16.20.0/24"
+  availability_zone = "us-west-2a"
+  map_public_ip_on_launch = true
+}
+
+resource "aws_instance" "foo" {
+  ami = "ami-22b9a343" # us-west-2
+  instance_type = "t2.micro"
+  associate_public_ip_address = false
+  subnet_id = "${aws_subnet.public_subnet.id}"
+  tags {
+    Name = "tf-acctest-%d"
+  }
+}`, rInt, rInt)
+}
